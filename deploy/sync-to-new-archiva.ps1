@@ -48,7 +48,14 @@ function Copy-Into {
     return
   }
   New-Item -ItemType Directory -Force -Path $To | Out-Null
-  Copy-Item -LiteralPath $From -Destination $To -Recurse -Force
+  if (Test-Path -LiteralPath $From -PathType Container) {
+    # 目录要拷**内容**。直接 Copy-Item -LiteralPath <dir> -Destination <已存在的dir>
+    # 会在目标里再造一层同名目录，变成 deploy/deploy/... —— 第一次跑就踩了。
+    Copy-Item -Path (Join-Path $From '*') -Destination $To -Recurse -Force
+  }
+  else {
+    Copy-Item -LiteralPath $From -Destination $To -Force
+  }
 }
 
 # ---- 1. 重新生成补丁 ----
