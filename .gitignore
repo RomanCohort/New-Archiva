@@ -1,0 +1,9 @@
+# 密钥一律不许进仓库
+.airi-vtuber.key
+*.key
+*.env
+.env*
+
+# 临时 / 生成物
+*.log
+tmp/

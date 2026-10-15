@@ -1,0 +1,368 @@
+diff --git a/packages/stage-ui-live2d/src/components/scenes/live2d/Model.vue b/packages/stage-ui-live2d/src/components/scenes/live2d/Model.vue
+index 2e62527..6d28ed5 100644
+--- a/packages/stage-ui-live2d/src/components/scenes/live2d/Model.vue
++++ b/packages/stage-ui-live2d/src/components/scenes/live2d/Model.vue
+@@ -29,10 +29,12 @@ import {
+   disableLive2DSdkBreath,
+   live2DCanvasRectToParent,
+   useExpressionController,
++  useLive2dEmotionBridge,
+   useLive2DMotionManagerUpdate,
+   useMotionUpdatePluginAutoEyeBlink,
+   useMotionUpdatePluginBeatSync,
+   useMotionUpdatePluginBreathControl,
++  useMotionUpdatePluginEmotionOverlay,
+   useMotionUpdatePluginExpression,
+   useMotionUpdatePluginIdleDisable,
+   useMotionUpdatePluginIdleFocus,
+@@ -475,6 +477,12 @@ async function performModelLoad() {
+     motionManagerUpdate.register(useMotionUpdatePluginLipSync(mouthOpenSize, nowSpeaking), 'final')
+     motionManagerUpdate.register(useMotionUpdatePluginBreathControl(manualBreathControl), 'final')
+ 
++    // Emotion overlay goes last: it must see the values motions, expressions,
++    // blink and lip sync already wrote, so it can offset them instead of being
++    // overwritten by them. Fed by character-chat over /ws/live2d.
++    motionManagerUpdate.register(useMotionUpdatePluginEmotionOverlay(), 'final')
++    useLive2dEmotionBridge()
++
+     const hookedUpdate = motionManager.update as (model: PixiLive2DInternalModel['coreModel'], now: number) => boolean
+     motionManager.update = function (model: PixiLive2DInternalModel['coreModel'], now: number) {
+       return motionManagerUpdate.hookUpdate(model, now, hookedUpdate)
+diff --git a/packages/stage-ui-live2d/src/composables/live2d/emotion-bridge.ts b/packages/stage-ui-live2d/src/composables/live2d/emotion-bridge.ts
+new file mode 100644
+index 0000000..5709947
+--- /dev/null
++++ b/packages/stage-ui-live2d/src/composables/live2d/emotion-bridge.ts
+@@ -0,0 +1,320 @@
++import type { MotionManagerPlugin } from './motion-manager'
++
++import { useLocalStorage } from '@vueuse/core'
++import { ref } from 'vue'
++
++/**
++ * Emotion bridge — subscribes to character-chat's `/ws/live2d` and turns its
++ * emotion payload into Live2D parameter moves.
++ *
++ * Why a bridge instead of the existing tool path: with an external brain
++ * serving the chat (see character-chat/docs/AIRI_BRAIN.md) the built-in model
++ * never runs, so nothing calls AIRI's expression tools. The external brain
++ * does own a real emotion pipeline — label + intensity per turn — and already
++ * publishes it over a WebSocket, so this consumes that instead.
++ *
++ * Protocol (character-chat `src/character_chat/live2d/bridge.py`):
++ *
++ *   client -> {"type":"hello"} | {"type":"ping"} | {"type":"request_snapshot"}
++ *   server -> {"type":"ready","character":..,"snapshot":{ParamId: value}}
++ *             {"type":"emotion_updated","label","intensity","confidence","params"}
++ *             {"type":"message_sent","text"}
++ *
++ * `params` carries only the keys that changed; a key that returned to neutral
++ * arrives as an explicit `0`, values are already scaled by intensity.
++ */
++
++const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:8000/ws/live2d'
++
++/** Exponential smoothing rate for the overlay (per second). */
++const SMOOTHING_RATE = 6
++
++/**
++ * `character-chat` parameter -> AIRI parameter, applied as an **offset**.
++ *
++ * Two mismatches worth remembering:
++ * - hiyori has no `ParamEyeSmile`; its smile params are `ParamEyeLSmile` /
++ *   `ParamEyeRSmile`. (`Model.vue` sets `ParamEyeSmile`, which is a no-op on
++ *   this model — the overlay writes the ids the model actually has.)
++ * - `ParamMouthOpenY` is deliberately absent: the mouth belongs to AIRI's own
++ *   lip sync, and stealing it would fight the audio envelope.
++ */
++const OFFSET_MAP: Record<string, string[]> = {
++  ParamBodyAngleX: ['ParamBodyAngleX'],
++  ParamBrowLY: ['ParamBrowLY'],
++  ParamBrowRY: ['ParamBrowRY'],
++  ParamCheek: ['ParamCheek'],
++  ParamEyeSmile: ['ParamEyeLSmile', 'ParamEyeRSmile'],
++  ParamMouthForm: ['ParamMouthForm'],
++}
++
++/**
++ * `ParamEyeOpenY` is a *target openness*, not an offset: the brain's table uses
++ * 1.0 for wide eyes (flustered) and 0.5 for half-closed (sad), so adding it to
++ * an already-open eye (default 1) would just clamp and do nothing. Its meaning
++ * is "how far the eyes are allowed to open", which is exactly a `min()` — and
++ * `min()` is idempotent, so it composes with AIRI's own blink without any
++ * bookkeeping.
++ */
++const EYE_OPEN_IDS = ['ParamEyeLOpen', 'ParamEyeROpen']
++
++type OverlayMode = 'clampMax' | 'offset'
++
++interface OverlayTarget {
++  mode: OverlayMode
++  value: number
++}
++
++interface EmotionUpdatedPayload {
++  type: 'emotion_updated'
++  label?: string
++  intensity?: number
++  confidence?: number
++  params?: Record<string, number>
++}
++
++interface ReadyPayload {
++  type: 'ready'
++  character?: string
++  snapshot?: Record<string, number>
++}
++
++interface BridgeStatus {
++  connected: boolean
++  lastLabel: string
++  lastIntensity: number
++  lastAt: number
++  url: string
++}
++
++const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
++const clamp01 = (value: number) => clamp(value, 0, 1)
++
++const overlayTargets = ref<Record<string, OverlayTarget>>({})
++const bridgeStatus = ref<BridgeStatus>({
++  connected: false,
++  lastLabel: '',
++  lastIntensity: 0,
++  lastAt: 0,
++  url: DEFAULT_BRIDGE_URL,
++})
++
++let socket: WebSocket | undefined
++let reconnectTimer: ReturnType<typeof setTimeout> | undefined
++let reconnectDelay = 1000
++let started = false
++let bridgeUrl: ReturnType<typeof useLocalStorage<string>> | undefined
++let bridgeEnabled: ReturnType<typeof useLocalStorage<boolean>> | undefined
++
++/**
++ * Translate one payload into overlay targets.
++ *
++ * The payload replaces the whole target map on purpose: `params_diff` on the
++ * brain's side already emits explicit 0 for everything that returned to
++ * neutral, so anything missing here is neutral by definition.
++ */
++function applyParams(params: Record<string, number>, intensity: number, label: string) {
++  const next: Record<string, OverlayTarget> = {}
++  const safeIntensity = clamp01(Number.isFinite(intensity) ? intensity : 0)
++
++  for (const [brainParam, rawValue] of Object.entries(params)) {
++    const value = Number(rawValue)
++    if (!Number.isFinite(value))
++      continue
++
++    if (brainParam === 'ParamEyeOpenY') {
++      // Undo the intensity scaling the brain applied, then walk from "fully
++      // open" towards the emotion's target by the same intensity.
++      const target = safeIntensity > 0 ? value / safeIntensity : 1
++      const openness = clamp01(1 + (target - 1) * safeIntensity)
++      for (const id of EYE_OPEN_IDS)
++        next[id] = { mode: 'clampMax', value: openness }
++      continue
++    }
++
++    const ids = OFFSET_MAP[brainParam]
++    if (!ids)
++      continue
++    for (const id of ids)
++      next[id] = { mode: 'offset', value }
++  }
++
++  overlayTargets.value = next
++  bridgeStatus.value.lastLabel = label
++  bridgeStatus.value.lastIntensity = safeIntensity
++  bridgeStatus.value.lastAt = Date.now()
++}
++
++function handleMessage(raw: string) {
++  let event: unknown
++  try {
++    event = JSON.parse(raw)
++  }
++  catch {
++    return
++  }
++  if (!event || typeof event !== 'object')
++    return
++
++  const payload = event as ReadyPayload | EmotionUpdatedPayload | { type?: string }
++  if (payload.type === 'ready') {
++    bridgeStatus.value.connected = true
++    const snapshot = (payload as ReadyPayload).snapshot
++    if (snapshot && Object.keys(snapshot).length)
++      applyParams(snapshot, 1, 'snapshot')
++    return
++  }
++  if (payload.type === 'emotion_updated') {
++    const emotion = payload as EmotionUpdatedPayload
++    if (emotion.params)
++      applyParams(emotion.params, emotion.intensity ?? 0, emotion.label ?? '')
++  }
++  // `message_sent` is intentionally ignored: AIRI drives its own lip sync from
++  // the speech provider's audio, and a second audio path here would just race it.
++}
++
++function disconnect() {
++  if (reconnectTimer) {
++    clearTimeout(reconnectTimer)
++    reconnectTimer = undefined
++  }
++  if (socket) {
++    socket.onopen = null
++    socket.onmessage = null
++    socket.onclose = null
++    socket.onerror = null
++    try {
++      socket.close()
++    }
++    catch { /* already closed */ }
++    socket = undefined
++  }
++  bridgeStatus.value.connected = false
++  overlayTargets.value = {}
++}
++
++function scheduleReconnect() {
++  if (!bridgeEnabled?.value || reconnectTimer)
++    return
++  reconnectTimer = setTimeout(() => {
++    reconnectTimer = undefined
++    // 1s, 2s, 4s … capped: the brain may simply not be running yet.
++    reconnectDelay = Math.min(reconnectDelay * 2, 30_000)
++    connect()
++  }, reconnectDelay)
++}
++
++function connect() {
++  if (typeof WebSocket === 'undefined' || !bridgeEnabled?.value)
++    return
++
++  disconnect()
++  const url = bridgeUrl?.value || DEFAULT_BRIDGE_URL
++  bridgeStatus.value.url = url
++
++  let next: WebSocket
++  try {
++    next = new WebSocket(url)
++  }
++  catch {
++    scheduleReconnect()
++    return
++  }
++  socket = next
++
++  next.onopen = () => {
++    reconnectDelay = 1000
++    next.send(JSON.stringify({ type: 'hello' }))
++  }
++  next.onmessage = (message) => {
++    if (typeof message.data === 'string')
++      handleMessage(message.data)
++  }
++  next.onerror = () => {
++    // Swallowed: `onclose` always follows and owns the retry.
++  }
++  next.onclose = () => {
++    bridgeStatus.value.connected = false
++    scheduleReconnect()
++  }
++}
++
++/**
++ * Page-wide singleton: one socket per page, regardless of how often the model
++ * is swapped or how many components ask for it.
++ */
++export function useLive2dEmotionBridge() {
++  if (!bridgeUrl) {
++    bridgeUrl = useLocalStorage('settings/live2d/emotion-bridge/url', DEFAULT_BRIDGE_URL)
++    bridgeEnabled = useLocalStorage('settings/live2d/emotion-bridge/enabled', true)
++  }
++
++  if (!started) {
++    started = true
++    connect()
++    // Exposed for the Playwright probe in tools/airi-probe.mjs: it can read
++    // `status.lastLabel` to check the bridge really delivered an emotion.
++    if (typeof window !== 'undefined') {
++      ;(window as unknown as Record<string, unknown>).__airiEmotionBridge = {
++        status: bridgeStatus,
++        targets: overlayTargets,
++        connect,
++        disconnect,
++      }
++    }
++  }
++
++  return { targets: overlayTargets, status: bridgeStatus, connect, disconnect }
++}
++
++/**
++ * Applies the overlay in the `final` stage, i.e. after motions, expressions,
++ * blink and lip sync have written their values.
++ */
++export function useMotionUpdatePluginEmotionOverlay(): MotionManagerPlugin {
++  /** What we wrote last frame, so the model's own value can be recovered. */
++  const applied = new Map<string, OverlayTarget>()
++  /** Smoothed overlay value per parameter. */
++  const smoothed = new Map<string, number>()
++
++  return (ctx) => {
++    const targets = overlayTargets.value
++    const deltaSeconds = clamp((ctx.timeDelta || 0) / 1000, 0, 0.2)
++    // Frame-rate independent exponential approach.
++    const factor = 1 - Math.exp(-deltaSeconds * SMOOTHING_RATE)
++
++    for (const [id, target] of Object.entries(targets)) {
++      const current = ctx.model.getParameterValueById(id) ?? 0
++
++      if (target.mode === 'clampMax') {
++        const previous = smoothed.get(id) ?? 1
++        const next = previous + (target.value - previous) * factor
++        smoothed.set(id, next)
++        // Idempotent: never lifts the value, so a blink (0) still closes the eye.
++        ctx.model.setParameterValueById(id, Math.min(current, next))
++        continue
++      }
++
++      const previous = applied.get(id)
++      // Recover the value the model itself produced by removing our own last
++      // contribution — otherwise we would add on top of ourselves every frame.
++      const base = previous?.mode === 'offset' ? current - previous.value : current
++      const previousSmoothed = smoothed.get(id) ?? 0
++      const next = previousSmoothed + (target.value - previousSmoothed) * factor
++      smoothed.set(id, next)
++      ctx.model.setParameterValueById(id, base + next)
++      applied.set(id, { mode: 'offset', value: next })
++    }
++
++    // Hand back the parameters the emotion no longer drives.
++    for (const [id, previous] of [...applied.entries()]) {
++      if (id in targets)
++        continue
++      const current = ctx.model.getParameterValueById(id) ?? 0
++      if (previous.mode === 'offset')
++        ctx.model.setParameterValueById(id, current - previous.value)
++      applied.delete(id)
++      smoothed.delete(id)
++    }
++  }
++}
+diff --git a/packages/stage-ui-live2d/src/composables/live2d/index.ts b/packages/stage-ui-live2d/src/composables/live2d/index.ts
+index bc3d081..67d7a83 100644
+--- a/packages/stage-ui-live2d/src/composables/live2d/index.ts
++++ b/packages/stage-ui-live2d/src/composables/live2d/index.ts
+@@ -1,5 +1,6 @@
+ export * from './animation'
+ export * from './beat-sync'
++export * from './emotion-bridge'
+ export * from './expression-controller'
+ export * from './eye-tracking'
+ export * from './head-anchor'
+

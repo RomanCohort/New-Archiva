@@ -1,0 +1,15 @@
+# 本机部署：AIRI 当皮 · character-chat 当脑
+#
+# 上游模型 = 本机 llama-server 网关（OpenAI 协议，127.0.0.1:8001）。
+# 没有走云 API，也没有配兜底端点 —— 网关挂了就如实报错，不偷偷换模型。
+#
+# api_key 留空 → 读环境变量 CHARACTER_CHAT_LLM_API_KEY
+# （密钥在 C:\qwen-api\Vtuber\.airi-vtuber.key，别写进这个文件）
+llm:
+  api_key: ""
+  model_id: "qwen3.6-35b-a3b-base"
+  base_url: "http://127.0.0.1:8001/v1"
+  temperature: 0.75
+
+characters_dir: "config/characters"
+data_dir: "data"
